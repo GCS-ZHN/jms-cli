@@ -231,11 +231,11 @@ class WindowsConsole(LocalConsole):
     """
 
     def __init__(self) -> None:
-        console = _console()
-        self._h_in = console[0] if console else None
-        self._h_out = console[1] if console else None
-        self._in_mode: int | None = console[2] if console else None
-        self._out_mode: int | None = console[3] if console else None
+        h_in, in_mode, h_out, out_mode = _console_handles()
+        self._h_in = h_in
+        self._h_out = h_out
+        self._in_mode: int | None = in_mode
+        self._out_mode: int | None = out_mode
         self._buffer = bytearray()
         self._cond = threading.Condition()
         self._resize_callback: Callable[[], None] | None = None
@@ -245,33 +245,50 @@ class WindowsConsole(LocalConsole):
         self._old_stdout_mode: int | None = None
 
     def isatty(self) -> bool:
-        return self._in_mode is not None and self._out_mode is not None
+        # Parity with POSIX: only stdin must be a real console; stdout may
+        # be redirected (e.g. `jms login > file`).
+        return self._in_mode is not None
 
     def enter_raw(self) -> None:
         if not self.isatty():
             raise TerminalError("Interactive mode requires a TTY on stdin")
         import msvcrt
 
-        in_mode = (
-            (self._in_mode or 0)
-            | _ENABLE_VIRTUAL_TERMINAL_INPUT
-            | _ENABLE_WINDOW_INPUT
-            | _ENABLE_EXTENDED_FLAGS
-        ) & ~(
-            _ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
-            | _ENABLE_PROCESSED_INPUT | _ENABLE_QUICK_EDIT_MODE
-        )
-        out_mode = (
-            (self._out_mode or 0)
-            | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
-            | _ENABLE_WRAP_AT_EOL_OUTPUT
-        ) & ~_ENABLE_PROCESSED_OUTPUT
-        k32 = _get_kernel32()
-        if not k32.SetConsoleMode(self._h_in, in_mode) or \
-                not k32.SetConsoleMode(self._h_out, out_mode):
-            raise TerminalError("Failed to switch the Windows console to raw mode")
-        self._old_stdin_mode = msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
-        self._old_stdout_mode = msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+        try:
+            k32 = _get_kernel32()
+            if self._in_mode is not None:
+                in_mode = (
+                    (self._in_mode or 0)
+                    | _ENABLE_VIRTUAL_TERMINAL_INPUT
+                    | _ENABLE_WINDOW_INPUT
+                    | _ENABLE_EXTENDED_FLAGS
+                ) & ~(
+                    _ENABLE_LINE_INPUT | _ENABLE_ECHO_INPUT
+                    | _ENABLE_PROCESSED_INPUT | _ENABLE_QUICK_EDIT_MODE
+                )
+                if not k32.SetConsoleMode(self._h_in, in_mode):
+                    raise TerminalError(
+                        "Failed to switch the Windows console to raw mode",
+                    )
+            if self._out_mode is not None:
+                out_mode = (
+                    (self._out_mode or 0)
+                    | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                    | _ENABLE_WRAP_AT_EOL_OUTPUT
+                ) & ~_ENABLE_PROCESSED_OUTPUT
+                if not k32.SetConsoleMode(self._h_out, out_mode):
+                    raise TerminalError(
+                        "Failed to switch the Windows console to raw mode",
+                    )
+            self._old_stdin_mode = msvcrt.setmode(
+                sys.stdin.fileno(), os.O_BINARY,
+            )
+            self._old_stdout_mode = msvcrt.setmode(
+                sys.stdout.fileno(), os.O_BINARY,
+            )
+        except Exception:
+            self.exit_raw()
+            raise
         self._running = True
         self._reader = threading.Thread(
             target=self._reader_loop, name="jms-console-reader", daemon=True,
@@ -285,9 +302,9 @@ class WindowsConsole(LocalConsole):
         if self._reader is not None:
             self._reader.join(timeout=1.0)
             self._reader = None
-        if self._in_mode is not None:
+        if self._in_mode is not None and self._h_in is not None:
             _get_kernel32().SetConsoleMode(self._h_in, self._in_mode)
-        if self._out_mode is not None:
+        if self._out_mode is not None and self._h_out is not None:
             _get_kernel32().SetConsoleMode(self._h_out, self._out_mode)
         if self._old_stdin_mode is not None:
             try:
@@ -364,18 +381,19 @@ class WindowsConsole(LocalConsole):
             logger.debug("console resize handler error: %s", e)
 
 
-def _console() -> tuple | None:
-    """Return (h_in, h_out, in_mode, out_mode), or None without a console."""
+def _console_handles() -> tuple:
+    """Return (h_in, in_mode, h_out, out_mode); None entries if no console."""
     k32 = _get_kernel32()
     handles_modes: list[tuple] = []
     for handle_id in (-10, -11):  # STD_INPUT_HANDLE, STD_OUTPUT_HANDLE
         handle = k32.GetStdHandle(wintypes.DWORD(handle_id))
         mode = wintypes.DWORD()
-        if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
-            return None
-        handles_modes.append((handle, mode.value))
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            handles_modes.append((handle, mode.value))
+        else:
+            handles_modes.append((None, None))
     (h_in, in_mode), (h_out, out_mode) = handles_modes
-    return h_in, h_out, in_mode, out_mode
+    return h_in, in_mode, h_out, out_mode
 
 
 def get_local_console() -> LocalConsole:

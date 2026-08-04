@@ -7,12 +7,15 @@ loops themselves are tested with a FakeConsole in the backend tests.
 """
 
 import os
+import threading
+from unittest.mock import MagicMock
 
 import pytest
 
 from jms.transport.console import (
     LocalConsole,
     PosixConsole,
+    WindowsConsole,
     _key_to_bytes,
     get_local_console,
 )
@@ -52,6 +55,51 @@ def test_posix_console_exit_raw_without_enter_is_noop() -> None:
 def test_posix_console_isatty_reflects_stdin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from unittest.mock import MagicMock
     monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: False))
     assert PosixConsole().isatty() is False
+
+
+def test_windows_console_isatty_requires_stdin_console() -> None:
+    """Only stdin must be a console (stdout may be redirected)."""
+    console = WindowsConsole.__new__(WindowsConsole)
+    console._in_mode = None
+    console._out_mode = 0x0001
+    assert console.isatty() is False
+    console._in_mode = 0x0001
+    assert console.isatty() is True
+
+
+def test_windows_console_stdin_buffer_and_condition() -> None:
+    """wait_stdin/read_stdin expose reader-thread appends (pure logic)."""
+    console = WindowsConsole.__new__(WindowsConsole)
+    console._buffer = bytearray()
+    console._cond = threading.Condition()
+
+    with console._cond:
+        console._buffer.extend(b"abc")
+        console._cond.notify()
+    assert console.wait_stdin(0.1) is True
+    assert console.read_stdin() == b"abc"
+    assert console.read_stdin() == b""
+
+    # Empty buffer times out without data
+    assert console.wait_stdin(0.05) is False
+
+
+def test_windows_console_write_stdout_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Console output is chunked (single writes have a size limit)."""
+    console = WindowsConsole.__new__(WindowsConsole)
+    sizes: list[int] = []
+
+    def fake_write(fd: int, data: bytes) -> int:
+        sizes.append(len(data))
+        return len(data)
+
+    monkeypatch.setattr("jms.transport.console.os.write", fake_write)
+    monkeypatch.setattr(
+        "jms.transport.console.sys.stdout", MagicMock(fileno=lambda: 7),
+    )
+    console.write_stdout(b"x" * 70000)
+    assert sizes == [32768, 32768, 4464]
