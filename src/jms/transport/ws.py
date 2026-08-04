@@ -14,9 +14,7 @@ Notes (from reverse engineering — do not change):
 """
 
 import json
-import os
 import re
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -27,12 +25,8 @@ import websocket
 
 from jms.core.resources import AssetInfo
 from jms.core.auth import JMSSession
-from jms.transport.base import (
-    AbstractTerminal,
-    TerminalCapability,
-    local_tty_size,
-    strip_ansi,
-)
+from jms.transport.base import AbstractTerminal, TerminalCapability, strip_ansi
+from jms.transport.console import get_local_console
 from jms.transport.registry import register_backend
 from jms.transport.token import create_connection_token
 from jms.exceptions import TerminalError
@@ -271,29 +265,16 @@ class WSTerminal(AbstractTerminal):
         the KoKo read timeout and the Nginx reverse-proxy timeout.
 
         Raises:
-            TerminalError: stdin is not a TTY, or the platform cannot drive
-                a raw TTY (Windows).
+            TerminalError: stdin is not a TTY.
         """
-        if not sys.stdin.isatty():
+        console = get_local_console()
+        if not console.isatty():
             raise TerminalError("Interactive mode requires a TTY on stdin")
-        if os.name == "nt":
-            # termios/tty are POSIX-only; fail clearly instead of a raw
-            # ImportError so the user knows what to use instead.
-            raise TerminalError(
-                "Interactive mode is not supported on Windows (requires "
-                "POSIX termios); use `jms exec <target> -- <cmd>` instead"
-            )
 
-        import select
-        import signal
-        import termios
-        import tty
+        console.enter_raw()
 
-        stdin_fd = sys.stdin.fileno()
-        old_tty = termios.tcgetattr(stdin_fd)
-
-        def _resize(*_) -> None:
-            cols, rows = local_tty_size()
+        def _resize() -> None:
+            cols, rows = console.size()
             try:
                 self._ws.send(json.dumps({
                     "id": self._ws_id,
@@ -304,94 +285,88 @@ class WSTerminal(AbstractTerminal):
                 logger.debug("resize send error: %s", e)
 
         _resize()
-        old_handler = signal.signal(signal.SIGWINCH, _resize)
+        console.on_resize(_resize)
 
         self._start_heartbeat()
 
         disconnect_reason = "user disconnect (Ctrl+])"
 
         try:
-            tty.setraw(stdin_fd)
             self._ws.settimeout(0)
 
             running = True
             while running:
                 try:
-                    rlist, _, _ = select.select(
-                        [stdin_fd, self._ws.sock], [], [], 1.0,
-                    )
+                    stdin_ready = console.wait_stdin(0.05)
                 except (ValueError, OSError) as e:
-                    disconnect_reason = f"select error: {e}"
+                    disconnect_reason = f"console read error: {e}"
                     logger.debug(disconnect_reason)
                     break
 
-                if not rlist:
-                    continue
+                if stdin_ready:
+                    try:
+                        data = console.read_stdin()
+                    except OSError as e:
+                        disconnect_reason = f"stdin read error: {e}"
+                        logger.debug(disconnect_reason)
+                        running = False
+                        break
+                    if not data:
+                        disconnect_reason = "stdin EOF"
+                        running = False
+                        break
+                    if b"\x1d" in data:  # Ctrl+]
+                        disconnect_reason = "user disconnect (Ctrl+])"
+                        running = False
+                        break
+                    try:
+                        self._ws.send(json.dumps({
+                            "id": self._ws_id,
+                            "type": "TERMINAL_DATA",
+                            "data": data.decode("utf-8", errors="replace"),
+                        }))
+                    except Exception as e:
+                        disconnect_reason = f"ws send error: {e}"
+                        logger.warning("WebSocket send failed: %s", e)
+                        running = False
+                        break
 
-                for fd in rlist:
-                    if fd == stdin_fd:
-                        try:
-                            data = os.read(stdin_fd, 4096)
-                        except OSError as e:
-                            disconnect_reason = f"stdin read error: {e}"
-                            logger.debug(disconnect_reason)
+                try:
+                    opcode, ws_data = self._ws.recv_data()
+                    if opcode == 2:
+                        console.write_stdout(ws_data)
+                    elif opcode == 1:
+                        msg = json.loads(ws_data.decode("utf-8"))
+                        if msg.get("type") == "CLOSE":
+                            disconnect_reason = "server sent CLOSE"
+                            logger.info("Server sent CLOSE message")
                             running = False
-                            break
-                        if not data:
-                            disconnect_reason = "stdin EOF"
-                            running = False
-                            break
-                        if b"\x1d" in data:  # Ctrl+]
-                            disconnect_reason = "user disconnect (Ctrl+])"
-                            running = False
-                            break
-                        try:
-                            self._ws.send(json.dumps({
-                                "id": self._ws_id,
-                                "type": "TERMINAL_DATA",
-                                "data": data.decode("utf-8", errors="replace"),
-                            }))
-                        except Exception as e:
-                            disconnect_reason = f"ws send error: {e}"
-                            logger.warning("WebSocket send failed: %s", e)
-                            running = False
-                            break
-                    else:
-                        try:
-                            opcode, ws_data = self._ws.recv_data()
-                            if opcode == 2:
-                                os.write(sys.stdout.fileno(), ws_data)
-                            elif opcode == 1:
-                                msg = json.loads(ws_data.decode("utf-8"))
-                                if msg.get("type") == "CLOSE":
-                                    disconnect_reason = "server sent CLOSE"
-                                    logger.info("Server sent CLOSE message")
-                                    running = False
-                                elif msg.get("type") == "PING":
-                                    self._send_pong()
-                                else:
-                                    logger.debug(
-                                        "control message: type=%s",
-                                        msg.get("type"),
-                                    )
-                            elif opcode == 8:
-                                disconnect_reason = "WebSocket CLOSE frame received"
-                                logger.info(disconnect_reason)
-                                running = False
-                        except websocket.WebSocketConnectionClosedException as e:
-                            disconnect_reason = f"connection closed: {e}"
-                            logger.info("WebSocket connection closed: %s", e)
-                            running = False
-                            break
-                        except Exception as e:
-                            disconnect_reason = f"ws recv error: {e}"
-                            logger.warning("WebSocket recv error: %s", e)
-                            running = False
-                            break
+                        elif msg.get("type") == "PING":
+                            self._send_pong()
+                        else:
+                            logger.debug(
+                                "control message: type=%s",
+                                msg.get("type"),
+                            )
+                    elif opcode == 8:
+                        disconnect_reason = "WebSocket CLOSE frame received"
+                        logger.info(disconnect_reason)
+                        running = False
+                except websocket.WebSocketTimeoutException:
+                    continue  # nothing from the remote this round
+                except websocket.WebSocketConnectionClosedException as e:
+                    disconnect_reason = f"connection closed: {e}"
+                    logger.info("WebSocket connection closed: %s", e)
+                    running = False
+                    break
+                except Exception as e:
+                    disconnect_reason = f"ws recv error: {e}"
+                    logger.warning("WebSocket recv error: %s", e)
+                    running = False
+                    break
         finally:
             self._stop_heartbeat()
-            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
-            signal.signal(signal.SIGWINCH, old_handler)
+            console.exit_raw()
             logger.info("Interactive session ended: %s", disconnect_reason)
 
     def close(self) -> None:

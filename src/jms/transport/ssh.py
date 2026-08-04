@@ -8,9 +8,7 @@ Compared to the WebSocket backend:
     - SSH transport-level keepalive, no application heartbeat needed
 """
 
-import os
 import socket
-import sys
 import time
 from contextlib import contextmanager
 from typing import Iterator
@@ -20,11 +18,8 @@ import paramiko
 
 from jms.core.resources import AssetInfo
 from jms.core.auth import JMSSession
-from jms.transport.base import (
-    AbstractTerminal,
-    TerminalCapability,
-    local_tty_size,
-)
+from jms.transport.base import AbstractTerminal, TerminalCapability
+from jms.transport.console import get_local_console
 from jms.transport.registry import register_backend
 from jms.transport.token import KOKO_SSH_PORT, create_connection_token
 from jms.exceptions import TerminalError
@@ -160,115 +155,97 @@ class SSHTerminal(AbstractTerminal):
         """Start an interactive PTY relay (Ctrl+] to disconnect).
 
         Opens a session channel with a PTY and invokes a shell, then relays
-        I/O both ways between local stdin/stdout and the SSH channel,
-        syncing the remote terminal size on SIGWINCH.
+        I/O both ways between the local console and the SSH channel,
+        syncing the remote terminal size on resize events.
 
         Raises:
-            TerminalError: stdin is not a TTY, the platform cannot drive a
-                raw TTY (Windows), or the PTY shell failed.
+            TerminalError: stdin is not a TTY, or the PTY shell failed.
         """
-        if not sys.stdin.isatty():
+        console = get_local_console()
+        if not console.isatty():
             raise TerminalError("Interactive mode requires a TTY on stdin")
-        if os.name == "nt":
-            # termios/tty are POSIX-only; fail clearly instead of a raw
-            # ImportError so the user knows what to use instead.
-            raise TerminalError(
-                "Interactive mode is not supported on Windows (requires "
-                "POSIX termios); use `jms exec <target> -- <cmd>` instead"
-            )
 
-        import select
-        import signal
-        import termios
-        import tty
-
-        stdin_fd = sys.stdin.fileno()
-        old_tty = termios.tcgetattr(stdin_fd)
-
+        console.enter_raw()
         try:
             channel = self._transport.open_session()
         except Exception as e:
+            console.exit_raw()
             raise TerminalError(f"Failed to open SSH session: {e}") from e
 
-        cols, rows = local_tty_size()
+        cols, rows = console.size()
         try:
             channel.get_pty(term="xterm-256color", width=cols, height=rows)
             channel.invoke_shell()
             channel.settimeout(0)
         except Exception as e:
             channel.close()
+            console.exit_raw()
             raise TerminalError(f"Failed to start PTY shell: {e}") from e
 
-        def _resize(*_) -> None:
-            c, r = local_tty_size()
+        def _resize() -> None:
+            c, r = console.size()
             try:
                 channel.resize_pty(width=c, height=r)
             except Exception as e:
                 logger.debug("pty resize error: %s", e)
 
-        old_handler = signal.signal(signal.SIGWINCH, _resize)
+        console.on_resize(_resize)
         disconnect_reason = "user disconnect (Ctrl+])"
 
         try:
-            tty.setraw(stdin_fd)
-
             running = True
             while running:
+                if channel.closed or channel.exit_status_ready():
+                    disconnect_reason = "remote channel closed"
+                    break
+
                 try:
-                    rlist, _, _ = select.select([stdin_fd, channel], [], [], 1.0)
+                    stdin_ready = console.wait_stdin(0.05)
                 except (ValueError, OSError) as e:
-                    disconnect_reason = f"select error: {e}"
+                    disconnect_reason = f"console read error: {e}"
                     logger.debug(disconnect_reason)
                     break
 
-                if not rlist:
-                    # Liveness check while idle
-                    if channel.closed or channel.exit_status_ready():
-                        disconnect_reason = "remote channel closed"
+                if stdin_ready:
+                    try:
+                        data = console.read_stdin()
+                    except OSError as e:
+                        disconnect_reason = f"stdin read error: {e}"
+                        logger.debug(disconnect_reason)
+                        running = False
                         break
-                    continue
+                    if not data:
+                        disconnect_reason = "stdin EOF"
+                        running = False
+                        break
+                    if b"\x1d" in data:  # Ctrl+]
+                        disconnect_reason = "user disconnect (Ctrl+])"
+                        running = False
+                        break
+                    try:
+                        channel.sendall(data)
+                    except Exception as e:
+                        disconnect_reason = f"channel send error: {e}"
+                        logger.warning("SSH send failed: %s", e)
+                        running = False
+                        break
 
-                for fd in rlist:
-                    if fd == stdin_fd:
-                        try:
-                            data = os.read(stdin_fd, 4096)
-                        except OSError as e:
-                            disconnect_reason = f"stdin read error: {e}"
-                            logger.debug(disconnect_reason)
-                            running = False
-                            break
+                if channel.recv_ready():
+                    try:
+                        data = channel.recv(65536)
                         if not data:
-                            disconnect_reason = "stdin EOF"
+                            disconnect_reason = "remote channel closed"
                             running = False
                             break
-                        if b"\x1d" in data:  # Ctrl+]
-                            disconnect_reason = "user disconnect (Ctrl+])"
-                            running = False
-                            break
-                        try:
-                            channel.sendall(data)
-                        except Exception as e:
-                            disconnect_reason = f"channel send error: {e}"
-                            logger.warning("SSH send failed: %s", e)
-                            running = False
-                            break
-                    else:
-                        try:
-                            data = channel.recv(65536)
-                            if not data:
-                                disconnect_reason = "remote channel closed"
-                                running = False
-                                break
-                            os.write(sys.stdout.fileno(), data)
-                        except Exception as e:
-                            disconnect_reason = f"channel recv error: {e}"
-                            logger.debug(disconnect_reason)
-                            running = False
-                            break
+                        console.write_stdout(data)
+                    except Exception as e:
+                        disconnect_reason = f"channel recv error: {e}"
+                        logger.debug(disconnect_reason)
+                        running = False
+                        break
         finally:
             channel.close()
-            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
-            signal.signal(signal.SIGWINCH, old_handler)
+            console.exit_raw()
             logger.info("Interactive session ended: %s", disconnect_reason)
 
     def close(self) -> None:

@@ -203,12 +203,122 @@ def test_interactive_requires_tty(monkeypatch: pytest.MonkeyPatch) -> None:
         SSHTerminal(MagicMock()).interactive()
 
 
-def test_interactive_unsupported_on_windows(
+class FakeConsole:
+    """In-memory LocalConsole stand-in for relay-loop tests."""
+
+    def __init__(self, stdin: list[bytes] | None = None) -> None:
+        self.queue = list(stdin or [])
+        self.stdout: list[bytes] = []
+        self.raw = False
+        self.resize_cb = None
+
+    def isatty(self) -> bool:
+        return True
+
+    def enter_raw(self) -> None:
+        self.raw = True
+
+    def exit_raw(self) -> None:
+        self.raw = False
+
+    def wait_stdin(self, timeout: float) -> bool:
+        return bool(self.queue)
+
+    def read_stdin(self) -> bytes:
+        return self.queue.pop(0) if self.queue else b""
+
+    def write_stdout(self, data: bytes) -> None:
+        self.stdout.append(bytes(data))
+
+    def size(self) -> tuple[int, int]:
+        return (120, 40)
+
+    def on_resize(self, callback) -> None:
+        self.resize_cb = callback
+
+
+def _interactive_channel() -> MagicMock:
+    channel = MagicMock()
+    channel.closed = False
+    channel.exit_status_ready.return_value = False
+    channel.recv_ready.return_value = False
+    return channel
+
+
+def _run_interactive(
+    console: FakeConsole, channel: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Windows raises a clear TerminalError instead of ModuleNotFoundError."""
-    monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: True))
-    monkeypatch.setattr("jms.transport.ssh.os.name", "nt")
+    transport = MagicMock()
+    transport.open_session.return_value = channel
+    monkeypatch.setattr("jms.transport.ssh.get_local_console", lambda: console)
+    SSHTerminal(transport).interactive()
 
-    with pytest.raises(TerminalError, match="Windows"):
-        SSHTerminal(MagicMock()).interactive()
+
+def test_interactive_relays_stdin_and_ctrl_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stdin bytes are sent; Ctrl+] disconnects and raw mode is restored."""
+    channel = _interactive_channel()
+    console = FakeConsole([b"whoami\r", b"\x1d"])
+    _run_interactive(console, channel, monkeypatch)
+
+    assert channel.get_pty.call_args.kwargs == {
+        "term": "xterm-256color", "width": 120, "height": 40,
+    }
+    channel.invoke_shell.assert_called_once()
+    sent = [call.args[0] for call in channel.sendall.call_args_list]
+    assert sent == [b"whoami\r"]
+    assert console.raw is False  # exit_raw ran in the finally block
+    channel.close.assert_called()
+
+
+def test_interactive_relays_remote_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote bytes reach the console; channel EOF disconnects."""
+    channel = _interactive_channel()
+    channel.recv_ready.side_effect = [True, True]
+    channel.recv.side_effect = [b"hello\r\n", b""]
+    console = FakeConsole([])
+    _run_interactive(console, channel, monkeypatch)
+
+    assert console.stdout == [b"hello\r\n"]
+    channel.close.assert_called()
+
+
+def test_interactive_stdin_eof_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty stdin read (EOF) disconnects without sending anything."""
+    channel = _interactive_channel()
+    console = FakeConsole([b""])
+    _run_interactive(console, channel, monkeypatch)
+
+    channel.sendall.assert_not_called()
+    channel.close.assert_called()
+
+
+def test_interactive_remote_close_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote channel closing is detected while idle."""
+    channel = _interactive_channel()
+    channel.exit_status_ready.return_value = True
+    console = FakeConsole([])
+    _run_interactive(console, channel, monkeypatch)
+
+    channel.close.assert_called()
+
+
+def test_interactive_resize_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Console resize events resize the remote PTY."""
+    channel = _interactive_channel()
+    console = FakeConsole([b"x", b"\x1d"])
+    _run_interactive(console, channel, monkeypatch)
+
+    assert console.resize_cb is not None
+    console.resize_cb()
+    channel.resize_pty.assert_called_once_with(width=120, height=40)

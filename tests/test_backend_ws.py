@@ -292,15 +292,98 @@ def test_heartbeat_sends_app_level_ping(
     assert pings[0]["id"] == "ws-uuid-1"
 
 
-def test_interactive_unsupported_on_windows(
+class FakeConsole:
+    """In-memory LocalConsole stand-in for relay-loop tests."""
+
+    def __init__(self, stdin: list[bytes] | None = None) -> None:
+        self.queue = list(stdin or [])
+        self.stdout: list[bytes] = []
+        self.raw = False
+        self.resize_cb = None
+
+    def isatty(self) -> bool:
+        return True
+
+    def enter_raw(self) -> None:
+        self.raw = True
+
+    def exit_raw(self) -> None:
+        self.raw = False
+
+    def wait_stdin(self, timeout: float) -> bool:
+        return bool(self.queue)
+
+    def read_stdin(self) -> bytes:
+        return self.queue.pop(0) if self.queue else b""
+
+    def write_stdout(self, data: bytes) -> None:
+        self.stdout.append(bytes(data))
+
+    def size(self) -> tuple[int, int]:
+        return (120, 40)
+
+    def on_resize(self, callback) -> None:
+        self.resize_cb = callback
+
+
+def _ws_interactive(
+    ws: FakeWebSocket, console: FakeConsole,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Windows raises a clear TerminalError instead of ModuleNotFoundError."""
-    monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: True))
-    monkeypatch.setattr("jms.transport.ws.os.name", "nt")
+    monkeypatch.setattr("jms.transport.ws.get_local_console", lambda: console)
+    WSTerminal(ws, "ws-uuid-1").interactive()
 
-    with pytest.raises(TerminalError, match="Windows"):
-        WSTerminal(FakeWebSocket(), "ws-uuid-1").interactive()
+
+def test_interactive_relays_stdin_and_ctrl_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stdin bytes become TERMINAL_DATA; Ctrl+] disconnects."""
+    ws = FakeWebSocket()
+    console = FakeConsole([b"ls\r", b"\x1d"])
+    _ws_interactive(ws, console, monkeypatch)
+
+    sent = [json.loads(s) for s in ws.sent]
+    data_msgs = [m for m in sent if m.get("type") == "TERMINAL_DATA"]
+    assert [m["data"] for m in data_msgs] == ["ls\r"]
+    assert console.raw is False  # exit_raw ran in the finally block
+
+
+def test_interactive_relays_remote_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binary frames reach the console; a CLOSE frame ends the relay."""
+    ws = FakeWebSocket([(2, b"hello\r\n"), (8, b"")])
+    console = FakeConsole([])
+    _ws_interactive(ws, console, monkeypatch)
+
+    assert console.stdout == [b"hello\r\n"]
+
+
+def test_interactive_server_close_message_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server-sent CLOSE text message ends the relay."""
+    ws = FakeWebSocket([(1, json.dumps({"type": "CLOSE"}).encode())])
+    console = FakeConsole([])
+    _ws_interactive(ws, console, monkeypatch)
+
+    assert console.stdout == []
+
+
+def test_interactive_resize_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Console resize events send TERMINAL_RESIZE with the new size."""
+    ws = FakeWebSocket()
+    console = FakeConsole([b"x", b"\x1d"])
+    _ws_interactive(ws, console, monkeypatch)
+
+    assert console.resize_cb is not None
+    console.resize_cb()
+    sent = [json.loads(s) for s in ws.sent]
+    resizes = [m for m in sent if m.get("type") == "TERMINAL_RESIZE"]
+    assert len(resizes) == 2  # initial + callback
+    assert json.loads(resizes[-1]["data"]) == {"cols": 120, "rows": 40}
 
 
 def test_close_sends_close_frame_and_is_idempotent() -> None:

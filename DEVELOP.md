@@ -67,6 +67,7 @@ graph TD
 | `transport/base.py` | `AbstractTerminal` 抽象 + `TerminalCapability` 枚举 + strip_ansi | 无 |
 | `transport/registry.py` | 后端注册表：`register_backend` / `open_backend` / `list_backends` / `auto_sequence`（**后端扩展点**） | base, core, exceptions |
 | `transport/token.py` | 连接 token 创建（KoKo 2222，`JMS-{id}`/token 绕过 MFA） | core, exceptions |
+| `transport/console.py` | 本地交互终端抽象：POSIX(termios)/Windows(console API)，ssh/ws 的 interactive 共用 | base, exceptions, log |
 | `transport/ssh.py` | KoKo SSH 终端 + `open_koko_transport`，import 时自注册 | registry, token, base, core, log, exceptions |
 | `transport/ws.py` | KoKo WebSocket 终端（二进制帧 + 应用层 PING keepalive），import 时自注册 | registry, token, base, core, log, exceptions |
 | `io/verify.py` | 本地/远程 md5 比对（RemoteHasher 走终端 execute） | transport, exceptions |
