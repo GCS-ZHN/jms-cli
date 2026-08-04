@@ -90,3 +90,22 @@ class TestErrorPaths:
         patched["open_transport"].side_effect = TerminalError("connect failed")
         with pytest.raises(TerminalError):
             run_bridge("web-01", "prod", "true")
+
+
+def test_windows_binary_stdio_and_no_sigpipe(
+    patched: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No SIGPIPE on Windows; binary stdio hook is invoked for all fds."""
+    binary_stdio = mock.MagicMock()
+    monkeypatch.setattr(
+        "jms.io.ssh_pipe._set_windows_binary_stdio", binary_stdio,
+    )
+    monkeypatch.delattr("signal.SIGPIPE", raising=False)
+    # pytest capture re-wraps sys.stdout/stderr after fixture setup, so
+    # patch stdio here (inside the test body) to control the fds.
+    monkeypatch.setattr(sys, "stdin", mock.MagicMock(fileno=lambda: 0))
+    monkeypatch.setattr(sys, "stdout", mock.MagicMock(fileno=lambda: 1))
+    monkeypatch.setattr(sys, "stderr", mock.MagicMock(fileno=lambda: 2))
+
+    assert run_bridge("web-01", "prod", "rsync --server .") == 0
+    binary_stdio.assert_called_once_with((0, 1, 2))

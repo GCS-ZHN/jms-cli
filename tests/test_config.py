@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Tests for jms.config."""
 
+import os
 import stat
 
 import pytest
@@ -43,6 +44,10 @@ def test_save_load_round_trip(tmp_path) -> None:
     assert raw["servers"]["prod"]["otp_secret"].startswith("enc:v1:")
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX permission bits are meaningless on Windows (ACLs govern)",
+)
 def test_file_permissions_0600(tmp_path) -> None:
     p = tmp_path / "config.yaml"
     _save(p)
@@ -51,7 +56,7 @@ def test_file_permissions_0600(tmp_path) -> None:
 
 def test_save_config_without_fchmod(tmp_path, monkeypatch) -> None:
     """Platforms without os.fchmod (Windows) still save config fine."""
-    monkeypatch.delattr("os.fchmod")
+    monkeypatch.delattr("os.fchmod", raising=False)
     p = tmp_path / "config.yaml"
     _save(p)
     assert load_config(str(p)).servers["prod"].password == "pw"

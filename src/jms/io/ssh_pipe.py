@@ -39,6 +39,23 @@ from jms.config import load_config
 from jms.log import logger
 
 
+def _set_windows_binary_stdio(fds: tuple[int, ...]) -> None:
+    """Force Windows stdio fds to binary mode (no-op on POSIX).
+
+    Windows stdio fds default to text mode (CRLF translation), which
+    corrupts rsync/scp protocol bytes. Best-effort: some fds may not be
+    settable (e.g. already closed), in which case relaying continues.
+    """
+    if os.name != "nt":
+        return
+    import msvcrt
+    for fd in fds:
+        try:
+            msvcrt.setmode(fd, os.O_BINARY)
+        except OSError:
+            logger.debug("setmode(O_BINARY) failed on fd %d", fd)
+
+
 def run_bridge(
     asset_name: str,
     server_alias: str,
@@ -84,7 +101,12 @@ def run_bridge(
     stdout_fd = sys.stdout.fileno()
     stderr_fd = sys.stderr.fileno()
 
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    _set_windows_binary_stdio((stdin_fd, stdout_fd, stderr_fd))
+
+    # SIGPIPE is POSIX-only; on Windows the relay threads already swallow
+    # OSError from a closed pipe.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     # Use threads for stdin→channel and channel→stdout so that a
     # blocked read on one direction doesn't stall the other.

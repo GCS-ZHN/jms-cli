@@ -26,3 +26,30 @@ jobs:
 
       - name: Build
         run: uv build
+
+  # No Windows device is available locally, so component feasibility is
+  # probed empirically on a headless Windows runner. The probe reports
+  # (never asserts): console APIs cannot be fully exercised without an
+  # interactive console, but pywinpty/ConPTY can.
+  windows-feasibility:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.10"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run flake8 src/ tests/
+
+      - name: Test (unit, no real server)
+        run: uv run pytest tests/ -q
+
+      - name: Probe Windows terminal-stack components
+        run: >-
+          uv run --with pywinpty --with windows-curses
+          python scripts/windows_feasibility.py

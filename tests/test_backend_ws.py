@@ -2,7 +2,10 @@
 """Tests for jms.transport.ws — websocket.create_connection 全部 mock。"""
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import time
 from unittest.mock import MagicMock
 
@@ -17,6 +20,37 @@ ASSET = AssetInfo(
     id="asset-uuid-1", name="web1", address="10.0.0.1",
     account="@USER", protocol="ssh",
 )
+
+
+def _usable_bash() -> str | None:
+    """Return a working POSIX bash, preferring Git Bash on Windows.
+
+    ``bash`` on the Windows PATH may be the WSL launcher, which fails
+    without an installed distribution, so candidates are validated by
+    actually running them.
+    """
+    candidates: list[str] = []
+    if os.name == "nt":
+        candidates.extend([
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
+        ])
+    found = shutil.which("bash")
+    if found:
+        candidates.append(found)
+    for cand in candidates:
+        try:
+            proc = subprocess.run(
+                [cand, "-c", "exit 0"], capture_output=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode == 0:
+            return cand
+    return None
+
+
+_USABLE_BASH = _usable_bash()
 
 
 class FakeWebSocket:
@@ -301,14 +335,13 @@ def test_execute_check_raises_on_timeout() -> None:
         term.execute("whoami", timeout=1, check=True)
 
 
+@pytest.mark.skipif(_USABLE_BASH is None, reason="requires a working bash")
 def test_execute_rc_marker_expands_in_real_shell() -> None:
     """生成的 full_cmd 在真实 shell 里必须产出 __JMSRC 数字标记（回归 $__rc__ bug）。"""
-    import subprocess
-
     marker = "__JMSDONE_123__"
     full_cmd = f"false; __rc=$?; echo {marker}; echo __JMSRC:${{__rc}}__"
     proc = subprocess.run(
-        ["bash", "-c", full_cmd], capture_output=True, text=True,
+        [_USABLE_BASH, "-c", full_cmd], capture_output=True, text=True,
         timeout=10,
     )
     assert proc.returncode == 0
