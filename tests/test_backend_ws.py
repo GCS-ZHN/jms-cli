@@ -258,6 +258,17 @@ def test_heartbeat_sends_app_level_ping(
     assert pings[0]["id"] == "ws-uuid-1"
 
 
+def test_interactive_unsupported_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows raises a clear TerminalError instead of ModuleNotFoundError."""
+    monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: True))
+    monkeypatch.setattr("jms.transport.ws.os.name", "nt")
+
+    with pytest.raises(TerminalError, match="Windows"):
+        WSTerminal(FakeWebSocket(), "ws-uuid-1").interactive()
+
+
 def test_close_sends_close_frame_and_is_idempotent() -> None:
     ws = FakeWebSocket()
     term = WSTerminal(ws, "ws-uuid-1")

@@ -228,8 +228,11 @@ def save_config(cfg: AppConfig, config_path: Optional[str] = None) -> Path:
     # Write with 0600 from the start — no window where creds are group/world-readable
     data = yaml.safe_dump(raw, allow_unicode=True, sort_keys=False, default_flow_style=False)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    # mode only applies at creation; enforce 0600 for pre-existing files too
-    os.fchmod(fd, 0o600)
+    # mode only applies at creation; enforce 0600 for pre-existing files too.
+    # POSIX-only: Windows has no permission bits (ACLs govern access) and
+    # os.fchmod is not always available there.
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(data)
     return path

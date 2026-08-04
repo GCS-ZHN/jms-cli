@@ -164,15 +164,23 @@ class SSHTerminal(AbstractTerminal):
         syncing the remote terminal size on SIGWINCH.
 
         Raises:
-            TerminalError: stdin is not a TTY, or the PTY shell failed.
+            TerminalError: stdin is not a TTY, the platform cannot drive a
+                raw TTY (Windows), or the PTY shell failed.
         """
+        if not sys.stdin.isatty():
+            raise TerminalError("Interactive mode requires a TTY on stdin")
+        if os.name == "nt":
+            # termios/tty are POSIX-only; fail clearly instead of a raw
+            # ImportError so the user knows what to use instead.
+            raise TerminalError(
+                "Interactive mode is not supported on Windows (requires "
+                "POSIX termios); use `jms exec <target> -- <cmd>` instead"
+            )
+
         import select
         import signal
         import termios
         import tty
-
-        if not sys.stdin.isatty():
-            raise TerminalError("Interactive mode requires a TTY on stdin")
 
         stdin_fd = sys.stdin.fileno()
         old_tty = termios.tcgetattr(stdin_fd)

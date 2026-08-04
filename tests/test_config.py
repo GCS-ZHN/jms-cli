@@ -49,6 +49,14 @@ def test_file_permissions_0600(tmp_path) -> None:
     assert stat.S_IMODE(p.stat().st_mode) == 0o600
 
 
+def test_save_config_without_fchmod(tmp_path, monkeypatch) -> None:
+    """Platforms without os.fchmod (Windows) still save config fine."""
+    monkeypatch.delattr("os.fchmod")
+    p = tmp_path / "config.yaml"
+    _save(p)
+    assert load_config(str(p)).servers["prod"].password == "pw"
+
+
 def test_missing_file_raises(tmp_path) -> None:
     with pytest.raises(ConfigError, match="Config not found"):
         load_config(str(tmp_path / "nope.yaml"))

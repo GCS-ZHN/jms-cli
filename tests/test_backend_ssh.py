@@ -201,3 +201,14 @@ def test_interactive_requires_tty(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(TerminalError, match="requires a TTY"):
         SSHTerminal(MagicMock()).interactive()
+
+
+def test_interactive_unsupported_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows raises a clear TerminalError instead of ModuleNotFoundError."""
+    monkeypatch.setattr("sys.stdin", MagicMock(isatty=lambda: True))
+    monkeypatch.setattr("jms.transport.ssh.os.name", "nt")
+
+    with pytest.raises(TerminalError, match="Windows"):
+        SSHTerminal(MagicMock()).interactive()
