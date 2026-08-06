@@ -6,6 +6,7 @@ mapping helper and idempotent state handling are covered here. The relay
 loops themselves are tested with a FakeConsole in the backend tests.
 """
 
+import codecs
 import os
 import threading
 from unittest.mock import MagicMock
@@ -89,8 +90,9 @@ def test_windows_console_stdin_buffer_and_condition() -> None:
 def test_windows_console_write_stdout_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Console output is chunked (single writes have a size limit)."""
+    """Redirected-stdout fallback writes are chunked via os.write."""
     console = WindowsConsole.__new__(WindowsConsole)
+    console._h_out = None
     sizes: list[int] = []
 
     def fake_write(fd: int, data: bytes) -> int:
@@ -103,3 +105,44 @@ def test_windows_console_write_stdout_chunks(
     )
     console.write_stdout(b"x" * 70000)
     assert sizes == [32768, 32768, 4464]
+
+
+def test_windows_console_write_stdout_console_path_uses_write_console_w(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Console output is UTF-8 decoded and written via WriteConsoleW."""
+    console = WindowsConsole.__new__(WindowsConsole)
+    console._h_out = object()
+    console._decoder = codecs.getincrementaldecoder("utf-8")()
+    fake_kernel32 = MagicMock()
+    fake_kernel32.WriteConsoleW.side_effect = lambda *_: True
+    monkeypatch.setattr(
+        "jms.transport.console._get_kernel32", lambda: fake_kernel32,
+    )
+
+    console.write_stdout(b"hi")
+    console.write_stdout(b"\xe4\xb8")  # first half of 中
+    console.write_stdout(b"\xad")      # second half
+
+    texts = [
+        "".join(call.args[1]) for call in fake_kernel32.WriteConsoleW.call_args_list
+    ]
+    assert texts == ["hi", "中"]
+
+
+def test_windows_console_write_console_chunks_at_8192_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large console writes are split into 8192-char chunks."""
+    console = WindowsConsole.__new__(WindowsConsole)
+    console._h_out = object()
+    console._decoder = codecs.getincrementaldecoder("utf-8")()
+    fake_kernel32 = MagicMock()
+    fake_kernel32.WriteConsoleW.side_effect = lambda *_: True
+    monkeypatch.setattr(
+        "jms.transport.console._get_kernel32", lambda: fake_kernel32,
+    )
+
+    console.write_stdout(b"x" * 20000)
+    sizes = [call.args[2] for call in fake_kernel32.WriteConsoleW.call_args_list]
+    assert sizes == [8192, 8192, 3616]
