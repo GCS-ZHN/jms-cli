@@ -159,10 +159,12 @@ MFA 字段差异、WS 二进制帧、marker×2），mock 只能证明"代码按�
 ## 5. 已知问题（Known Issues）
 
 - **Windows 交互终端（`jms login`）**：需要 Win10+（控制台 VT 支持）。
-  输出走 `WriteConsoleW` + 会话期 UTF-8 码页（65001，退出恢复），避免
-  GBK 等非 UTF-8 码页下的乱码与字面转义序列；按住重复键按
-  `wRepeatCount` 透传。经典 conhost 与 Windows Terminal 均为目标环境，
-  真机验证进行中（见 GitHub issue #1）。
+  输出走 `os.write` 原始字节路径 + 会话期 UTF-8 码页（65001，退出恢复）：
+  `WriteConsoleW` 会把 C0/C1 控制字符转成可打印字形并绕过 VT 解析器，
+  因此必须走字节流让控制台按码页解码并交给 VT 解析（参考
+  microsoft/terminal#16825）；按住重复键按 `wRepeatCount` 透传。经典
+  conhost 与 Windows Terminal 均为目标环境，真机验证进行中（见
+  GitHub issue #1）。
 
 - **rsync 下载方向 >4KB 会挂起**（KoKo 通道半关闭问题）：本地 rsync 收完
   flist 后主动半关闭 stdin，桥把 EOF 转成 SSH channel EOF 时 KoKo 会掐掉

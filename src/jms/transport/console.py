@@ -6,8 +6,9 @@ Those primitives are platform-specific:
 
 - POSIX: termios/tty + select on the stdin fd + SIGWINCH
 - Windows: SetConsoleMode (raw-ish input, VT mode) + a ReadConsoleInputW
-  reader thread + WriteConsoleW output (UTF-8, independent of the console
-  codepage) + msvcrt binary stdio fallback for redirected stdout
+  reader thread + byte-exact ``os.write`` output (raw bytes through the
+  session UTF-8 console codepage, so the console's VT parser sees the ANSI
+  byte stream) + msvcrt binary stdio for redirected stdout
 
 ``get_local_console()`` returns the right implementation; backends only
 talk to ``LocalConsole``, so the relay loop in ``transport/ssh.py`` and
@@ -16,7 +17,6 @@ talk to ``LocalConsole``, so the relay loop in ``transport/ssh.py`` and
 
 from __future__ import annotations
 
-import codecs
 import ctypes
 import os
 import sys
@@ -117,11 +117,6 @@ def _get_kernel32() -> "ctypes.WinDLL":
     k32.SetConsoleCP.argtypes = [wintypes.UINT]
     k32.SetConsoleOutputCP.restype = wintypes.BOOL
     k32.SetConsoleOutputCP.argtypes = [wintypes.UINT]
-    k32.WriteConsoleW.restype = wintypes.BOOL
-    k32.WriteConsoleW.argtypes = [
-        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
-    ]
     k32.ReadConsoleInputW.restype = wintypes.BOOL
     k32.ReadConsoleInputW.argtypes = [
         wintypes.HANDLE, ctypes.POINTER(_INPUT_RECORD), wintypes.DWORD,
@@ -143,11 +138,6 @@ def _key_to_bytes(char: str, control_key_state: int) -> bytes:
     if control_key_state & _CTRL_MASK and 0x40 <= ord(char) <= 0x5F:
         return bytes([ord(char) & 0x1F])
     return char.encode("utf-8", errors="replace")
-
-
-def _as_wide_buffer(text: str) -> "ctypes.Array":
-    """Build a WCHAR array from text (embedded NULs included)."""
-    return (wintypes.WCHAR * len(text))(*text)
 
 
 class LocalConsole(ABC):
@@ -265,9 +255,6 @@ class WindowsConsole(LocalConsole):
         self._old_stdout_mode: int | None = None
         self._old_in_cp: int | None = None
         self._old_out_cp: int | None = None
-        # Incremental decoder keeps multi-byte UTF-8 chars split across
-        # network chunks intact before WriteConsoleW.
-        self._decoder = codecs.getincrementaldecoder("utf-8")()
 
     def isatty(self) -> bool:
         # Parity with POSIX: only stdin must be a real console; stdout may
@@ -371,35 +358,19 @@ class WindowsConsole(LocalConsole):
             return data
 
     def write_stdout(self, data: bytes) -> None:
-        if self._h_out is not None:
-            self._write_console(data)
-        else:
-            self._write_fd(data)
+        """Write raw bytes to stdout in bounded chunks.
 
-    def _write_fd(self, data: bytes) -> None:
+        Always uses the byte path (``os.write``), even when stdout is a
+        console: with the session codepage pinned to UTF-8 and VT
+        processing enabled, the console decodes the byte stream and
+        interprets ANSI sequences. Writing via WriteConsoleW would bypass
+        the VT parser and render C0/C1 controls as printable glyphs.
+        """
         fd = sys.stdout.fileno()
         offset = 0
         while offset < len(data):
             chunk = data[offset:offset + 32 * 1024]
             offset += os.write(fd, chunk)
-
-    def _write_console(self, data: bytes) -> None:
-        """Decode UTF-8 and write via WriteConsoleW (VT-aware, codepage-free)."""
-        text = self._decoder.decode(data)
-        if not text:
-            return
-        k32 = _get_kernel32()
-        offset = 0
-        while offset < len(text):
-            chunk = text[offset:offset + 8192]
-            offset += len(chunk)
-            written = wintypes.DWORD()
-            if not k32.WriteConsoleW(
-                self._h_out, _as_wide_buffer(chunk), len(chunk),
-                ctypes.byref(written), None,
-            ):
-                # Console handle no longer writable — fall back to the fd.
-                self._write_fd(chunk.encode("utf-8", errors="replace"))
 
     def size(self) -> tuple[int, int]:
         return local_tty_size()
