@@ -429,6 +429,8 @@ class WindowsConsole(LocalConsole):
         data = _key_to_bytes(key.uChar, key.dwControlKeyState)
         if not data:
             return
+        # Held keys arrive as one record with wRepeatCount > 1.
+        data *= max(int(key.wRepeatCount), 1)
         with self._cond:
             self._buffer.extend(data)
             self._cond.notify()

@@ -17,6 +17,7 @@ from jms.transport.console import (
     LocalConsole,
     PosixConsole,
     WindowsConsole,
+    _KEY_EVENT_RECORD,
     _key_to_bytes,
     get_local_console,
 )
@@ -85,6 +86,28 @@ def test_windows_console_stdin_buffer_and_condition() -> None:
 
     # Empty buffer times out without data
     assert console.wait_stdin(0.05) is False
+
+
+def test_windows_console_handle_key_repeats_and_skips_keyup() -> None:
+    """Held keys repeat via wRepeatCount; key-up records are ignored."""
+    console = WindowsConsole.__new__(WindowsConsole)
+    console._buffer = bytearray()
+    console._cond = threading.Condition()
+
+    key = _KEY_EVENT_RECORD()
+    key.bKeyDown = True
+    key.wRepeatCount = 3
+    key.uChar = "a"
+    key.dwControlKeyState = 0
+    console._handle_key(key)
+    with console._cond:
+        assert bytes(console._buffer) == b"aaa"
+
+    key.bKeyDown = False
+    key.wRepeatCount = 5
+    console._handle_key(key)
+    with console._cond:
+        assert bytes(console._buffer) == b"aaa"
 
 
 def test_windows_console_write_stdout_chunks(
